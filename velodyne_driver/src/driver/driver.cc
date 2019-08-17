@@ -36,25 +36,34 @@ VelodyneDriver::VelodyneDriver(ros::NodeHandle node,
   // get model name, validate string, determine packet rate
   private_nh.param("model", config_.model, std::string("64E"));
   double packet_rate;                   // packet frequency (Hz)
+  std::string model_full_name;
   if ((config_.model == "64E_S2") || 
       (config_.model == "64E_S2.1"))    // generates 1333312 points per second
     {                                   // 1 packet holds 384 points
       packet_rate = 3472.17;            // 1333312 / 384
+      model_full_name = std::string("HDL-") + config_.model;
     }
   else if (config_.model == "64E")
     {
       packet_rate = 2600.0;
+      model_full_name = std::string("HDL-") + config_.model;
     }
   else if (config_.model == "32E")
     {
       packet_rate = 1808.0;
+      model_full_name = std::string("HDL-") + config_.model;
+    }
+  else if (config_.model == "VLP16")
+    {
+      packet_rate = 754;             // 754 Packets/Second for Last or Strongest mode 1508 for dual (VLP-16 User Manual)
+      model_full_name = "VLP-16";
     }
   else
     {
       ROS_ERROR_STREAM("unknown Velodyne LIDAR model: " << config_.model);
       packet_rate = 2600.0;
     }
-  std::string deviceName("Velodyne HDL-" + config_.model);
+  std::string deviceName(std::string("Velodyne ") + model_full_name);
 
   private_nh.param("rpm", config_.rpm, 600.0);
   ROS_INFO_STREAM(deviceName << " rotating at " << config_.rpm << " RPM");
@@ -71,7 +80,36 @@ VelodyneDriver::VelodyneDriver(ros::NodeHandle node,
 
   double cut_angle;
   private_nh.param("cut_angle", cut_angle, -0.01);
-  config_.cut_angle = int(cut_angle*100);
+  if (cut_angle < 0.0)
+  {
+    ROS_INFO_STREAM("Cut at specific angle feature deactivated.");
+  }
+  else if (cut_angle < (2*M_PI))
+  {
+      ROS_INFO_STREAM("Cut at specific angle feature activated. " 
+        "Cutting velodyne points always at " << cut_angle << " rad.");
+  }
+  else
+  {
+    ROS_ERROR_STREAM("cut_angle parameter is out of range. Allowed range is "
+    << "between 0.0 and 2*PI or negative values to deactivate this feature.");
+    cut_angle = -0.01;
+  }
+
+  // Convert cut_angle from radian to one-hundredth degree, 
+  // which is used in velodyne packets
+  config_.cut_angle = int((cut_angle*360/(2*M_PI))*100);
+
+  int udp_port;
+  private_nh.param("port", udp_port, (int) DATA_PORT_NUMBER);
+
+  // Initialize dynamic reconfigure
+  srv_ = boost::make_shared <dynamic_reconfigure::Server<velodyne_driver::
+    VelodyneNodeConfig> > (private_nh);
+  dynamic_reconfigure::Server<velodyne_driver::VelodyneNodeConfig>::
+    CallbackType f;
+  f = boost::bind (&VelodyneDriver::callback, this, _1, _2);
+  srv_->setCallback (f); // Set callback function und call initially
 
   // initialize diagnostics
   diagnostics_.setHardwareID(deviceName);
@@ -88,19 +126,21 @@ VelodyneDriver::VelodyneDriver(ros::NodeHandle node,
                                         TimeStampStatusParam()));
 
   // open Velodyne input device or file
-  if (dump_file != "")
+  if (dump_file != "")                  // have PCAP file?
     {
-      input_.reset(new velodyne_driver::InputPCAP(private_nh,
-                                                  packet_rate,
-                                                  dump_file));
+      // read data from packet capture file
+      input_.reset(new velodyne_driver::InputPCAP(private_nh, udp_port,
+                                                  packet_rate, dump_file));
     }
   else
     {
-      input_.reset(new velodyne_driver::InputSocket(private_nh));
+      // read data from live socket
+      input_.reset(new velodyne_driver::InputSocket(private_nh, udp_port));
     }
 
-  // raw data output topic
-  output_ = node.advertise<velodyne_msgs::VelodyneScan>("velodyne_packets", 10);
+  // raw packet output topic
+  output_ =
+    node.advertise<velodyne_msgs::VelodyneScan>("velodyne_packets", 10);
 }
 
 /** poll the device
@@ -120,28 +160,29 @@ bool VelodyneDriver::poll(void)
     {
       while(true)
       {
-        int rc = input_->getPacket(&tmp_packet);
+        int rc = input_->getPacket(&tmp_packet, config_.time_offset);
         if (rc == 0) break;       // got a full packet?
         if (rc < 0) return false; // end of file reached?
       }
       scan->packets.push_back(tmp_packet);
 
-      static int last_base_rotation = -1;
+      static int last_azimuth = -1;
       // Extract base rotation of first block in packet
-      std::size_t rot_data_pos = 100*0+2;
-      int base_rotation = *( (u_int16_t*) (&tmp_packet.data[rot_data_pos]));
+      std::size_t azimuth_data_pos = 100*0+2;
+      int azimuth = *( (u_int16_t*) (&tmp_packet.data[azimuth_data_pos]));
+
       // Handle overflow 35999->0
-      if(base_rotation<last_base_rotation)
-        last_base_rotation-=36000;
+      if(azimuth<last_azimuth)
+        last_azimuth-=36000;
       // Check if currently passing cut angle
-      if(   last_base_rotation != -1
-         && last_base_rotation < config_.cut_angle
-         && base_rotation >= config_.cut_angle )
+      if(   last_azimuth != -1
+         && last_azimuth < config_.cut_angle
+         && azimuth >= config_.cut_angle )
       {
-        last_base_rotation = base_rotation;
+        last_azimuth = azimuth;
         break; // Cut angle passed, one full revolution collected
       }
-      last_base_rotation = base_rotation;
+      last_azimuth = azimuth;
     }
   }
   else // standard behaviour
@@ -154,7 +195,7 @@ bool VelodyneDriver::poll(void)
       while (true)
         {
           // keep reading until full packet received
-          int rc = input_->getPacket(&scan->packets[i]);
+          int rc = input_->getPacket(&scan->packets[i], config_.time_offset);
           if (rc == 0) break;       // got a full packet?
           if (rc < 0) return false; // end of file reached?
         }
@@ -163,7 +204,7 @@ bool VelodyneDriver::poll(void)
 
   // publish message using time of last packet read
   ROS_DEBUG("Publishing a full Velodyne scan.");
-  scan->header.stamp = ros::Time(scan->packets[config_.npackets - 1].stamp);
+  scan->header.stamp = scan->packets.back().stamp;
   scan->header.frame_id = config_.frame_id;
   output_.publish(scan);
 
@@ -173,6 +214,13 @@ bool VelodyneDriver::poll(void)
   diagnostics_.update();
 
   return true;
+}
+
+void VelodyneDriver::callback(velodyne_driver::VelodyneNodeConfig &config,
+              uint32_t level)
+{
+  ROS_INFO("Reconfigure Request");
+  config_.time_offset = config.time_offset;
 }
 
 } // namespace velodyne_driver
